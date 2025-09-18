@@ -1,0 +1,417 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Audio Saver — Download, Save & Play (Legal files only)</title>
+<style>
+  :root{ --bg:#0b1220; --card:#071428; --muted:#99a6b0; --accent:#38bdf8; --ok:#34d399; --danger:#fb7185; color:#e6eef6; font-family:Inter,system-ui,Arial;}
+  body{ margin:0; background:linear-gradient(180deg,#041023,#071428); padding:18px; min-height:100vh; }
+  .wrap{ max-width:1000px; margin:0 auto; display:grid; grid-template-columns: 420px 1fr; gap:16px; align-items:start;}
+  .card{ background:rgba(255,255,255,0.02); padding:12px; border-radius:10px; border:1px solid rgba(255,255,255,0.03); box-shadow:0 6px 20px rgba(2,6,23,0.6);}
+  h1{ margin:0 0 8px 0; font-size:18px; }
+  label{ display:block; font-size:13px; color:var(--muted); margin-top:8px; }
+  input,select,textarea,button{ width:100%; padding:8px 10px; border-radius:8px; border:1px solid rgba(255,255,255,0.04); background:transparent; color:inherit; box-sizing:border-box; }
+  textarea{ min-height:70px; resize:vertical; }
+  .row{ display:flex; gap:8px; align-items:center; }
+  .small{ width:auto; padding:6px 10px; font-size:13px; }
+  .list{ display:flex; flex-direction:column; gap:8px; margin-top:10px; max-height:600px; overflow:auto; }
+  .item{ display:flex; justify-content:space-between; gap:8px; align-items:center; padding:8px; border-radius:8px; background:rgba(255,255,255,0.01);}
+  .muted{ color:var(--muted); font-size:13px; }
+  audio{ width:100%; margin-top:8px; }
+  footer{ margin-top:12px; color:var(--muted); font-size:13px; grid-column:1/-1; text-align:center;}
+  @media (max-width:900px){ .wrap{ grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <aside class="card">
+    <h1>Audio Saver</h1>
+    <div class="muted">Save audio files from the Internet (CORS-enabled & legal) or upload local tracks. Stored locally in this browser.</div>
+
+    <label>1) Add remote audio URL (must permit CORS)</label>
+    <input id="remoteUrl" placeholder="https://archive.org/download/xxx/track.mp3" />
+    <label style="margin-top:6px">Title (optional)</label>
+    <input id="remoteTitle" placeholder="Track title (optional)" />
+    <div style="display:flex; gap:8px; margin-top:8px;">
+      <button id="fetchBtn">Fetch & Save</button>
+      <button id="fetchHeadBtn" class="small">Check URL (HEAD)</button>
+    </div>
+    <div id="fetchStatus" class="muted" style="margin-top:8px;"></div>
+
+    <hr style="margin:12px 0; border:none; height:1px; background:rgba(255,255,255,0.02)">
+
+    <label>2) Upload local audio file</label>
+    <input id="localFile" type="file" accept="audio/*" />
+    <label style="margin-top:6px">Title (optional)</label>
+    <input id="localTitle" placeholder="Track title (optional)" />
+    <div style="display:flex; gap:8px; margin-top:8px;">
+      <button id="uploadBtn">Save Upload</button>
+      <button id="clearAll" class="small" style="background:transparent;border:1px solid rgba(255,255,255,0.04);">Clear ALL</button>
+    </div>
+
+    <hr style="margin:12px 0; border:none; height:1px; background:rgba(255,255,255,0.02)">
+
+    <label>3) Import/Export metadata (no blobs)</label>
+    <div style="display:flex; gap:8px;">
+      <button id="exportMeta" class="small">Export JSON</button>
+      <label style="margin:0;"><input id="importMetaFile" type="file" accept=".json" style="display:none"><button id="importMetaBtn" class="small">Import JSON</button></label>
+    </div>
+    <div class="muted" style="margin-top:8px">Note: exported JSON contains metadata (title, id, filename). To move blobs you must export individual files using the download button per track.</div>
+  </aside>
+
+  <main class="card">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <div>
+        <h2 style="margin:0 0 4px 0">Saved Tracks</h2>
+        <div class="muted">Tracks saved in IndexedDB (this browser profile)</div>
+      </div>
+      <div style="display:flex; gap:8px;">
+        <input id="search" placeholder="Search by title or filename" />
+        <button id="applySearch" class="small">Search</button>
+        <button id="resetSearch" class="small" style="background:transparent;border:1px solid rgba(255,255,255,0.04);">Reset</button>
+      </div>
+    </div>
+
+    <div id="tracks" class="list" aria-live="polite"></div>
+
+    <div id="playerArea" style="margin-top:12px;">
+      <div id="nowPlayingTitle" style="font-weight:700"></div>
+      <audio id="audioPlayer" controls></audio>
+      <div id="playerMeta" class="muted" style="margin-top:6px"></div>
+    </div>
+  </main>
+</div>
+
+<footer>Only save/download files you are allowed to. Remote files require CORS. Built with IndexedDB (no server).</footer>
+
+<script>
+/* Single-file Audio Saver
+   - Stores audio blobs + metadata in IndexedDB
+   - Fetch remote URL and save blob (if CORS allows)
+   - Upload local files and save
+   - Play from saved blobs
+   - Download saved blob back to disk
+   - Export/import metadata (not blobs)
+*/
+
+/* ---------------- IndexedDB ---------------- */
+const DB_NAME = 'audioSaverDB_v1';
+const DB_VERSION = 1;
+let db;
+
+function openDB(){
+  return new Promise((resolve,reject)=>{
+    const r = indexedDB.open(DB_NAME, DB_VERSION);
+    r.onupgradeneeded = (e) => {
+      const idb = e.target.result;
+      if(!idb.objectStoreNames.contains('tracks')){
+        const s = idb.createObjectStore('tracks', { keyPath: 'id' });
+        s.createIndex('title','title',{unique:false});
+        s.createIndex('filename','filename',{unique:false});
+      }
+    };
+    r.onsuccess = e => { db = e.target.result; resolve(db); };
+    r.onerror = e => reject(e.target.error);
+  });
+}
+function tx(storeNames, mode='readonly'){
+  const t = db.transaction(storeNames, mode);
+  const stores = {};
+  for(const s of storeNames) stores[s] = t.objectStore(s);
+  return { t, stores };
+}
+function generateId(){ return Math.random().toString(36).slice(2,10); }
+
+/* store track: { id, title, filename, mime, size, addedAt, blob } */
+async function saveTrack(obj){
+  const {stores, t} = tx(['tracks'],'readwrite');
+  return new Promise((res,rej)=>{
+    stores.tracks.put(obj).onsuccess = ()=>res(obj);
+    t.onerror = ()=>rej(t.error);
+  });
+}
+async function getAllTracks(){
+  const {stores} = tx(['tracks'],'readonly');
+  return new Promise((res,rej)=>{
+    const arr=[];
+    stores.tracks.openCursor().onsuccess = e=>{
+      const c = e.target.result;
+      if(c){ arr.push(c.value); c.continue(); } else res(arr);
+    };
+  });
+}
+async function getTrack(id){
+  const {stores} = tx(['tracks'],'readonly');
+  return new Promise((res,rej)=>{
+    const r = stores.tracks.get(id);
+    r.onsuccess = ()=>res(r.result);
+    r.onerror = ()=>rej(r.error);
+  });
+}
+async function deleteTrack(id){
+  const {stores, t} = tx(['tracks'],'readwrite');
+  return new Promise((res,rej)=>{
+    stores.tracks.delete(id);
+    t.oncomplete = ()=>res();
+    t.onerror = ()=>rej(t.error);
+  });
+}
+async function clearAllData(){
+  const {stores, t} = tx(['tracks'],'readwrite');
+  stores.tracks.clear();
+  return new Promise((res,rej)=>{
+    t.oncomplete = ()=>res();
+    t.onerror = ()=>rej(t.error);
+  });
+}
+
+/* ---------------- UI & Actions ---------------- */
+const remoteUrl = document.getElementById('remoteUrl');
+const remoteTitle = document.getElementById('remoteTitle');
+const fetchBtn = document.getElementById('fetchBtn');
+const fetchHeadBtn = document.getElementById('fetchHeadBtn');
+const fetchStatus = document.getElementById('fetchStatus');
+
+const localFile = document.getElementById('localFile');
+const localTitle = document.getElementById('localTitle');
+const uploadBtn = document.getElementById('uploadBtn');
+
+const tracksDiv = document.getElementById('tracks');
+const audioPlayer = document.getElementById('audioPlayer');
+const nowPlayingTitle = document.getElementById('nowPlayingTitle');
+const playerMeta = document.getElementById('playerMeta');
+
+const exportMeta = document.getElementById('exportMeta');
+const importMetaFile = document.getElementById('importMetaFile');
+const importMetaBtn = document.getElementById('importMetaBtn');
+
+const searchInput = document.getElementById('search');
+const applySearch = document.getElementById('applySearch');
+const resetSearch = document.getElementById('resetSearch');
+
+const clearAllBtn = document.getElementById('clearAll');
+
+let currentPlayingObjectURL = null;
+
+/* initialize DB and UI */
+window.addEventListener('load', async ()=>{
+  await openDB();
+  renderTrackList();
+});
+
+/* helper to show status */
+function setStatus(txt){
+  fetchStatus.textContent = txt;
+}
+
+/* HEAD check for URL (to see mime, size) */
+fetchHeadBtn.addEventListener('click', async ()=>{
+  const url = remoteUrl.value.trim();
+  if(!url){ setStatus('Enter a URL first.'); return; }
+  setStatus('Checking URL (HEAD)...');
+  try{
+    // Try HEAD first; if not allowed, fall back to GET with Range request.
+    const head = await fetch(url, { method:'HEAD' });
+    if(!head.ok) throw new Error('HEAD request failed: ' + head.status);
+    const type = head.headers.get('content-type') || 'unknown';
+    const len = head.headers.get('content-length') || 'unknown';
+    setStatus(`OK — type: ${type}, size: ${len}`);
+  }catch(err){
+    setStatus('HEAD failed: ' + err.message + ' — try Fetch & Save which will use GET (CORS required).');
+  }
+});
+
+/* Fetch remote file and save blob */
+fetchBtn.addEventListener('click', async ()=>{
+  const url = remoteUrl.value.trim();
+  if(!url){ setStatus('Enter a URL to fetch.'); return; }
+  const title = remoteTitle.value.trim();
+  setStatus('Fetching... (this may take a few seconds)');
+  try{
+    const resp = await fetch(url);
+    if(!resp.ok) throw new Error('Fetch failed: ' + resp.status);
+    const contentType = resp.headers.get('content-type') || '';
+    const filename = (new URL(url)).pathname.split('/').pop() || ('track-' + Date.now());
+    const buffer = await resp.arrayBuffer();
+    const blob = new Blob([buffer], { type: contentType || 'audio/mpeg' });
+    const obj = {
+      id: generateId(),
+      title: title || filename,
+      filename,
+      mime: blob.type,
+      size: blob.size,
+      addedAt: new Date().toISOString(),
+      blob
+    };
+    await saveTrack(obj);
+    setStatus('Saved: ' + obj.title);
+    remoteUrl.value=''; remoteTitle.value='';
+    renderTrackList();
+  }catch(err){
+    setStatus('Fetch/save failed: ' + err.message + ' (likely CORS or network)');
+  }
+});
+
+/* Upload local file and save */
+uploadBtn.addEventListener('click', async ()=>{
+  const f = localFile.files[0];
+  if(!f){ alert('Pick a local audio file to upload'); return; }
+  const title = localTitle.value.trim() || f.name;
+  const blob = f.slice(0, f.size, f.type || 'audio/mpeg');
+  const obj = {
+    id: generateId(),
+    title,
+    filename: f.name,
+    mime: f.type || 'audio/mpeg',
+    size: f.size,
+    addedAt: new Date().toISOString(),
+    blob
+  };
+  await saveTrack(obj);
+  localFile.value=''; localTitle.value='';
+  setStatus('Uploaded and saved: ' + title);
+  renderTrackList();
+});
+
+/* Render track list (with optional filter) */
+async function renderTrackList(filter=''){
+  const all = await getAllTracks();
+  const q = filter.trim().toLowerCase();
+  const list = all.filter(t => {
+    if(!q) return true;
+    return (t.title||'').toLowerCase().includes(q) || (t.filename||'').toLowerCase().includes(q);
+  }).sort((a,b) => new Date(b.addedAt) - new Date(a.addedAt));
+  tracksDiv.innerHTML = '';
+  if(list.length === 0){ tracksDiv.innerHTML = '<div class="muted">No tracks saved.</div>'; return; }
+  for(const t of list){
+    const el = document.createElement('div'); el.className='item';
+    const left = document.createElement('div'); left.style.flex='1';
+    left.innerHTML = `<div style="font-weight:700">${escapeHtml(t.title)}</div><div class="muted">${escapeHtml(t.filename)} • ${formatBytes(t.size)} • added ${new Date(t.addedAt).toLocaleString()}</div>`;
+    const right = document.createElement('div'); right.style.textAlign='right';
+    // buttons: play, download, delete, info
+    const playBtn = document.createElement('button'); playBtn.textContent='Play'; playBtn.className='small';
+    playBtn.addEventListener('click', ()=>playTrack(t.id));
+    const dlBtn = document.createElement('button'); dlBtn.textContent='Download'; dlBtn.className='small';
+    dlBtn.addEventListener('click', ()=>downloadTrack(t.id));
+    const delBtn = document.createElement('button'); delBtn.textContent='Delete'; delBtn.className='small';
+    delBtn.style.background='transparent'; delBtn.style.border='1px solid rgba(255,255,255,0.04)';
+    delBtn.addEventListener('click', async ()=>{
+      if(!confirm('Delete track "'+t.title+'"?')) return;
+      await deleteTrack(t.id);
+      if(currentPlayingObjectURL && audioPlayer.dataset.trackId === t.id){
+        stopPlayer();
+      }
+      renderTrackList(searchInput.value || '');
+    });
+    const infoBtn = document.createElement('button'); infoBtn.textContent='Info'; infoBtn.className='small';
+    infoBtn.style.background='transparent'; infoBtn.style.border='1px solid rgba(255,255,255,0.04)';
+    infoBtn.addEventListener('click', ()=> alert(JSON.stringify({ id:t.id, title:t.title, filename:t.filename, mime:t.mime, size:t.size, addedAt:t.addedAt }, null, 2)));
+    right.appendChild(playBtn); right.appendChild(dlBtn); right.appendChild(delBtn); right.appendChild(infoBtn);
+    el.appendChild(left); el.appendChild(right);
+    tracksDiv.appendChild(el);
+  }
+}
+
+/* Play track by id */
+async function playTrack(id){
+  try{
+    const t = await getTrack(id);
+    if(!t || !t.blob){ alert('Track not found or missing blob'); return; }
+    // revoke old objectURL
+    if(currentPlayingObjectURL){ URL.revokeObjectURL(currentPlayingObjectURL); currentPlayingObjectURL = null; }
+    const url = URL.createObjectURL(t.blob);
+    currentPlayingObjectURL = url;
+    audioPlayer.src = url;
+    audioPlayer.dataset.trackId = t.id;
+    audioPlayer.play().catch(()=>{/* autoplay blocked */});
+    nowPlayingTitle.textContent = t.title;
+    playerMeta.textContent = `${t.filename} • ${formatBytes(t.size)} • ${t.mime}`;
+  }catch(err){
+    alert('Play failed: ' + err.message);
+  }
+}
+
+/* Stop player and revoke URL */
+function stopPlayer(){
+  audioPlayer.pause();
+  audioPlayer.removeAttribute('src');
+  if(currentPlayingObjectURL){ URL.revokeObjectURL(currentPlayingObjectURL); currentPlayingObjectURL = null; }
+  nowPlayingTitle.textContent = '';
+  playerMeta.textContent = '';
+  delete audioPlayer.dataset.trackId;
+}
+
+/* Download saved blob to user's disk */
+async function downloadTrack(id){
+  const t = await getTrack(id);
+  if(!t || !t.blob){ alert('Track not found'); return; }
+  const url = URL.createObjectURL(t.blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = t.filename || (t.title || 'track') + (t.mime && t.mime.includes('mp3') ? '.mp3' : '');
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+/* Export metadata (excluding blobs) */
+exportMeta.addEventListener('click', async ()=>{
+  const all = await getAllTracks();
+  const meta = all.map(t => ({ id: t.id, title: t.title, filename: t.filename, mime: t.mime, size: t.size, addedAt: t.addedAt }));
+  const blob = new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), tracks: meta }, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = 'audio-saver-meta.json'; a.click(); URL.revokeObjectURL(url);
+});
+
+/* Import metadata (merges metadata only, not blobs) */
+importMetaBtn.addEventListener('click', ()=> importMetaFile.click());
+importMetaFile.addEventListener('change', async (e)=>{
+  const f = e.target.files[0]; if(!f) return;
+  try{
+    const txt = await f.text();
+    const parsed = JSON.parse(txt);
+    if(!parsed.tracks) throw new Error('Invalid file');
+    // save metadata entries with no blob (blob = null) so user can re-add blobs manually later
+    for(const t of parsed.tracks){
+      const obj = { id: t.id || generateId(), title: t.title || 'unknown', filename: t.filename || '', mime: t.mime || 'audio/mpeg', size: t.size||0, addedAt: t.addedAt || new Date().toISOString(), blob: null };
+      await saveTrack(obj);
+    }
+    alert('Metadata imported. Note: blobs were not included — you will need to re-add files manually for playable copies.');
+    renderTrackList();
+  }catch(err){
+    alert('Import failed: ' + err.message);
+  } finally { e.target.value = ''; }
+});
+
+/* Search */
+applySearch.addEventListener('click', ()=> renderTrackList(searchInput.value || ''));
+resetSearch.addEventListener('click', ()=>{ searchInput.value=''; renderTrackList(''); });
+
+/* Clear all data */
+clearAllBtn.addEventListener('click', async ()=>{
+  if(!confirm('Delete ALL saved tracks (this cannot be undone)?')) return;
+  await clearAllData();
+  stopPlayer();
+  renderTrackList();
+});
+
+/* utilities */
+function escapeHtml(s=''){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function formatBytes(bytes){
+  if(!bytes && bytes !== 0) return 'unknown';
+  const units = ['B','KB','MB','GB'];
+  let i=0; let n = Number(bytes);
+  while(n >= 1024 && i < units.length-1){ n /= 1024; i++; }
+  return `${n % 1 === 0 ? n : n.toFixed(1)} ${units[i]}`;
+}
+
+/* revoke object URL when page unloads */
+window.addEventListener('beforeunload', ()=>{
+  if(currentPlayingObjectURL) URL.revokeObjectURL(currentPlayingObjectURL);
+});
+</script>
+</body>
+</html>
